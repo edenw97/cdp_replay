@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cdp-replay"
+version = "1.0.0"
+description = "Capture Chrome HTTP traffic via CDP and replay it against a mock server or any endpoint"
+requires-python = ">=3.10"
+
+[project.scripts]
+cdp-replay = "cdp_replay.__main__:main"
+
+[tool.setuptools]
+packages = ["cdp_replay"]
