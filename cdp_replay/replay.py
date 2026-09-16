@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import socket
+import ssl
 import threading
 
 from . import client
@@ -69,7 +70,17 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--port",
         type=int,
         default=8080,
-        help="replay server port (default: 8080, 0 picks a free port)",
+        help="replay server port (default 8080, 0 picks a free port)",
+    )
+    parser.add_argument(
+        "--tls-cert",
+        default=None,
+        help="path to the TLS certificate PEM for the embedded server (enables HTTPS with ALPN h2/http1.1)",
+    )
+    parser.add_argument(
+        "--tls-key",
+        default=None,
+        help="path to the TLS private key PEM for the embedded server",
     )
     client.add_arguments(parser, base_url_default=None, verify_body_default=True)
 
@@ -98,11 +109,18 @@ def main(args: argparse.Namespace) -> int:
             print("[replay] proxy is remote; binding the replay server to 0.0.0.0")
 
     try:
+        tls_context = server.build_tls_context(args.tls_cert, args.tls_key)
+    except (ValueError, OSError, ssl.SSLError) as exc:
+        print(f"[replay] {exc}")
+        return 2
+
+    try:
         replay_server = server.ReplayServer(
             (host, args.port),
             server.ReplayRequestHandler,
             matcher=server.ReplayMatcher(records),
             verbose=False,
+            tls_context=tls_context,
         )
     except OSError as exc:
         print(f"[replay] could not start the replay server on {host}:{args.port}: {exc}")
@@ -112,6 +130,7 @@ def main(args: argparse.Namespace) -> int:
     bound_host = str(address[0])
     bound_port = int(address[1])
     wildcard = bound_host in ("", "0.0.0.0", "::")
+    scheme = "https" if tls_context is not None else "http"
     base_url = args.base_url
     if base_url is None:
         if wildcard:
@@ -135,14 +154,17 @@ def main(args: argparse.Namespace) -> int:
                     f"({args.proxy[0]}) is remote, so the proxy cannot reach it. "
                     "Drop --host to bind 0.0.0.0 automatically, or pass a routable --host."
                 )
-        base_url = f"http://{base_host}:{bound_port}"
+        base_url = f"{scheme}://{base_host}:{bound_port}"
 
-    print(f"[replay] server listening on http://{bound_host}:{bound_port}")
+    print(f"[replay] server listening on {scheme}://{bound_host}:{bound_port}")
     print(f"[replay] target base URL: {base_url}")
     threading.Thread(target=replay_server.serve_forever, daemon=True).start()
 
     client_args = argparse.Namespace(**vars(args))
     client_args.base_url = base_url
+    if tls_context is not None and not client_args.insecure:
+        client_args.insecure = True
+        print("[replay] note: client certificate verification disabled for the embedded TLS server")
     try:
         rc = client.main(client_args)
     finally:

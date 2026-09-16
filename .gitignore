@@ -1,0 +1,32 @@
+# Bytecode / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Capture files (contain live cookies and bearer tokens - secrets)
+*.jsonl
+
+# TLS certificates / keys used for replay testing
+*.pem
+*.key
+*.crt
+*.csr
+
+# Test / coverage artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

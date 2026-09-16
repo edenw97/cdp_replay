@@ -36,6 +36,17 @@ SERVER_SUPPRESSED_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {
 }
 
 
+def normalize_http_version(protocol: str | None) -> str | None:
+    if not protocol:
+        return None
+    lowered = protocol.lower()
+    if lowered.startswith(("h3", "quic")):
+        return "h3"
+    if lowered.startswith("h2"):
+        return "h2"
+    return "h1"
+
+
 @dataclass(frozen=True)
 class ReplayRecord:
     index: int
@@ -59,6 +70,8 @@ class ReplayRecord:
     response_content_type: str | None
     recorded_wall_time: float | None
     failure: dict[str, Any] | None
+    protocol: str | None
+    http_version: str | None
     raw: dict[str, Any]
 
 
@@ -84,6 +97,12 @@ def header_lookup(headers: dict[str, str], name: str) -> str | None:
         if header_name.lower() == target:
             return value
     return None
+
+
+def split_header_value(value: str) -> list[str]:
+    """Split a CDP multi-line header value into one value per header field."""
+    pieces = [piece.strip() for piece in value.splitlines()]
+    return [piece for piece in pieces if piece]
 
 
 def parse_charset(content_type: str | None) -> str | None:
@@ -173,7 +192,10 @@ def build_replay_record(
     merged_response_headers = merge_header_maps(response)
     req_body = request_body_bytes(raw)
     resp_body = response_body_bytes(raw)
+    if isinstance(response_status, int) and response_status in (204, 304):
+        resp_body = b""
     timing = raw.get("timing") or {}
+    protocol = response.get("protocol") if isinstance(response.get("protocol"), str) else None
 
     return ReplayRecord(
         index=index,
@@ -197,6 +219,8 @@ def build_replay_record(
         response_content_type=header_lookup(merged_response_headers, "Content-Type"),
         recorded_wall_time=timing.get("wall_time"),
         failure=raw.get("failure"),
+        protocol=protocol,
+        http_version=normalize_http_version(protocol),
         raw=raw,
     )
 
@@ -255,6 +279,8 @@ def sanitize_request_headers(
 ) -> dict[str, str]:
     clean: dict[str, str] = {}
     for name, value in headers.items():
+        if name.startswith(":"):
+            continue
         lower_name = name.lower()
         if lower_name in CLIENT_SUPPRESSED_REQUEST_HEADERS:
             continue
@@ -264,12 +290,20 @@ def sanitize_request_headers(
     return clean
 
 
-def sanitize_response_headers(headers: dict[str, str], body: bytes) -> dict[str, str]:
+def sanitize_response_headers(
+    headers: dict[str, str],
+    body: bytes,
+    *,
+    http2: bool = False,
+) -> dict[str, str]:
     clean: dict[str, str] = {}
     for name, value in headers.items():
+        if name.startswith(":"):
+            continue
         if name.lower() in SERVER_SUPPRESSED_RESPONSE_HEADERS:
             continue
         clean[name] = value
     clean["Content-Length"] = str(len(body))
-    clean["Connection"] = "close"
+    if not http2:
+        clean["Connection"] = "close"
     return clean

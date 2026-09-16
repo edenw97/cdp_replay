@@ -23,7 +23,8 @@ Chrome ──capture──> capture.jsonl ──client──> target endpoint
 
 ## Requirements
 
-- Python >= 3.10 (stdlib only, no third-party dependencies)
+- Python >= 3.10
+- `h2` (installed automatically with the package; needed for HTTP/2 replay and serving)
 - Chrome or Chromium (for `capture`)
 
 ## Usage
@@ -56,6 +57,7 @@ containing:
 - full request and response headers, including the CDP "extra info" headers
 - request and response bodies (base64-encoded when binary)
 - status, status text, resource type, timing, initiator, and failure details
+- the HTTP protocol used for each request (`http/1.1`, `h2`, `h3`, ...)
 - redirect hops (each hop is written as its own record)
 
 Key options:
@@ -103,11 +105,22 @@ Responses carry `X-Replay-Match` (which strategy matched), `X-Replay-Record-Inde
 diagnostic. Hop-by-hop headers and `Content-Length` are rewritten; the server forces
 `Connection: close`.
 
-Options: `--host` (default `127.0.0.1`), `--port` (default `8080`), `--quiet`.
+Options: `--host` (default `127.0.0.1`), `--port` (default `8080`), `--tls-cert`/`--tls-key`
+(serve HTTPS with ALPN advertising both `h2` and `http/1.1`), `--quiet`.
 
-The built-in server is plain HTTP/1.1 only. To test TLS paths, wrap it with a TLS
-terminator (e.g. an external proxy or `ssl.wrap_socket` as done in this repo's tests)
-and point the client at it with `--insecure`.
+- Without `--tls-cert` the listener is plain HTTP/1.1 only (no h2c).
+- With `--tls-cert`/`--tls-key` the listener serves HTTP/1.1 and HTTP/2 on the same
+  port: the client picks via ALPN, exactly like a browser. Use a self-signed
+  certificate together with the client's `--insecure`.
+
+Recorded HTTP/2 pseudo-headers and CDP multi-line header values (e.g. joined
+`set-cookie` lines) are normalized automatically: pseudo-headers are stripped for
+HTTP/1.1 replay and re-derived from the request line for H2, and multi-line values
+are split into separate header fields.
+
+304/204 responses are replayed bodyless. CDP attaches the *cached* resource body
+to a 304, but a 304 never carries a body on the wire, so the recording's body is
+dropped and the replayed response is exactly what the origin sent.
 
 ## client
 
@@ -131,6 +144,32 @@ path and query. Each request is tagged with `X-Replay-Original-URL`,
 | `--timeout SECONDS`          | per-request timeout (default 15)                         |
 | `--preserve-host`            | send the original Host header                            |
 | `--insecure`                 | disable TLS certificate verification for https targets   |
+| `--protocol {auto,h1,h2}`    | HTTP version for replay (default `auto`, see below)      |
+| `--http2`                    | shortcut for `--protocol h2` (requires an https target)   |
+
+The client picks the protocol per request from the URL scheme and the recorded
+protocol (`Network.Response.protocol` is captured per request):
+
+- `auto` (the default) replays https requests with their recorded HTTP version:
+  HTTP/2 over TLS with ALPN `h2`, or HTTP/1.1 over TLS. Records captured over
+  HTTP/3 are replayed over HTTP/2 with a note.
+- Plain `http://` targets always use HTTP/1.1, like a browser: HTTP/2 is never
+  spoken in the clear (no h2c). Records captured over H2/H3 are downgraded with
+  a printed note.
+- `--protocol h2` (or `--http2`) forces HTTP/2 for all requests and errors out
+  if the target is not https; `--protocol h1` forces HTTP/1.1.
+
+For HTTP/2 requests:
+
+- `https://` targets use TLS with ALPN `h2` (an error is raised if the target does
+  not negotiate h2).
+- With `--proxy`, https requests are tunneled: the client sends `CONNECT` to the
+  proxy and speaks H2 inside the tunnel over TLS, so the proxy sees realistic
+  CONNECT traffic. Plain http requests through a proxy use absolute-form
+  HTTP/1.1, exactly like a browser.
+- Connections are pooled per origin and reused across requests (sequential streams,
+  no multiplexing). `--preserve-host` sets the `:authority` pseudo-header to the
+  original recorded host.
 
 Exit status is non-zero if any request mismatched, failed, or (with `--verify-body`) had a
 different body — suitable for golden-file regression checks in CI.
@@ -155,8 +194,13 @@ different defaults:
 |-------------------------------|----------------------------------------------------------|
 | `--host`                      | address the embedded server binds to (default `127.0.0.1`, or `0.0.0.0` when `--proxy` points at a remote host) |
 | `--port`                      | server port (default `8080`, `0` picks a free port)      |
+| `--tls-cert` / `--tls-key`    | run the embedded server with TLS (ALPN h2/http1.1) so HTTP/2 records are replayed over H2; the client is automatically run with `--insecure` for the self-signed case |
 | `--base-url URL`              | client target (default: derived from `--host`/`--port`)  |
 | `--verify-body` / `--no-verify-body` | response body check (on by default for `replay`)  |
+
+Without `--tls-cert` the embedded server is plain HTTP/1.1, so every record
+(including H2/H3 captures) is replayed over HTTP/1.1 with a printed note. Pass
+`--tls-cert`/`--tls-key` to exercise HTTP/2.
 
 Without `--proxy`, traffic goes directly from the client to the embedded server. With
 `--proxy`, the client's requests are routed through the proxy before they reach the
@@ -259,8 +303,13 @@ behind it) to see how it handles realistic traffic.
 
 ## Limitations
 
-- HTTP/1.1 only: H2/H3 traffic is captured at the semantic HTTP level but replayed as
-  HTTP/1.1.
+- Replay respects scheme and recorded protocol: https targets use the recorded
+  HTTP version (H2 over TLS/ALPN, HTTP/1.1 otherwise; `auto` default, or force
+  with `--protocol`). HTTP/3 replay is not supported yet — records captured over
+  HTTP/3 are replayed over HTTP/2. Plain http targets always use HTTP/1.1 (no h2c).
+- The capture does not record H2 connection/stream grouping, so H2 replay cannot
+  reproduce multiplexing: requests are sent sequentially over one reused connection
+  per origin.
 - Streaming (SSE) response bodies are captured as one accumulated body and replayed as a
   single buffered response; token-by-token streaming behavior is not reproduced.
 - WebSocket frames are not captured or replayed.
@@ -279,6 +328,7 @@ cdp-replay/
     ├── capture.py          # CDP capture command
     ├── common.py           # shared record model, header sanitation, helpers
     ├── server.py           # replay server command
-    ├── client.py           # replay client command
-    └── replay.py           # one-shot replay command (embedded server + client)
+    ├── client.py           # replay client command (HTTP/1.1 + HTTP/2)
+    ├── replay.py           # one-shot replay command (embedded server + client)
+    └── tests/test_h2.py    # HTTP/2 round-trip tests (unittest)
 ```
