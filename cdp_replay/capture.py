@@ -35,6 +35,15 @@ DEFAULT_MAX_POST_DATA_SIZE = 10_000_000
 DEFAULT_RECONNECT_INTERVAL = 1.0
 DEFAULT_STALLED_AFTER = 10.0
 WEBSOCKET_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+DEFAULT_MAX_WS_FRAMES = 20_000
+WS_OPCODE_NAMES = {
+    0: "continuation",
+    1: "text",
+    2: "binary",
+    8: "close",
+    9: "ping",
+    10: "pong",
+}
 
 
 class CDPError(RuntimeError):
@@ -54,6 +63,54 @@ class SessionInfo:
     target_type: str
     title: str = ""
     url: str = ""
+
+
+def parse_sse_events(text: str) -> list[dict[str, Any]]:
+    """Parse a Server-Sent Events stream into a list of events.
+
+    Each returned event is ``{"event": name, "id": id, "data": data}``.
+    Consecutive ``data:`` lines are joined with ``\\n`` as required by the
+    SSE specification; comment lines (``: keep-alive``) are ignored.
+    """
+    events: list[dict[str, Any]] = []
+    event_name = ""
+    event_id: str | None = None
+    data_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal event_name, event_id, data_lines
+        if data_lines or event_name or event_id is not None:
+            events.append(
+                {
+                    "event": event_name or "message",
+                    "id": event_id,
+                    "data": "\n".join(data_lines),
+                }
+            )
+        event_name = ""
+        event_id = None
+        data_lines = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            flush()
+            continue
+        if line.startswith(":"):
+            # Comment / keep-alive line.
+            continue
+        field, sep, value = line.partition(":")
+        if sep and value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_name = value
+        elif field == "data":
+            data_lines.append(value)
+        elif field == "id":
+            event_id = value
+        # "retry" and unknown fields are intentionally ignored.
+    flush()
+    return events
 
 
 DESCRIPTION = (
@@ -549,6 +606,11 @@ class CaptureRecorder:
         self.target_to_session: dict[str, str] = {}
         self.records: dict[tuple[str | None, str], dict[str, Any]] = {}
         self._output = open(output_path, "w", encoding="utf-8")
+        # SSE (text/event-stream) bodies are not available through
+        # Network.getResponseBody; they are pulled with
+        # Network.streamResourceContent while the stream is live.
+        self._sse_buffers: dict[tuple[str | None, str], bytearray] = {}
+        self._sse_stream_content_disabled = False
 
     def close(self, *, failure_reason: str | None = None) -> None:
         self.flush_pending(incomplete=True, failure_reason=failure_reason)
@@ -605,6 +667,33 @@ class CaptureRecorder:
             return
         if method == "Network.loadingFailed":
             self._handle_loading_failed(session_id, params)
+            return
+        if method == "Network.dataReceived":
+            self._handle_data_received(session_id, params)
+            return
+        if method == "Network.eventSourceMessageReceived":
+            self._handle_event_source_message(session_id, params)
+            return
+        if method == "Network.webSocketCreated":
+            self._handle_ws_created(session_id, params)
+            return
+        if method == "Network.webSocketWillSendHandshakeRequest":
+            self._handle_ws_handshake_request(session_id, params)
+            return
+        if method == "Network.webSocketHandshakeResponseReceived":
+            self._handle_ws_handshake_response(session_id, params)
+            return
+        if method == "Network.webSocketFrameSent":
+            self._handle_ws_frame(session_id, params, direction="sent")
+            return
+        if method == "Network.webSocketFrameReceived":
+            self._handle_ws_frame(session_id, params, direction="received")
+            return
+        if method == "Network.webSocketFrameError":
+            self._handle_ws_error(session_id, params)
+            return
+        if method == "Network.webSocketClosed":
+            self._handle_ws_closed(session_id, params)
             return
 
     def ensure_session_enabled(self, session_id: str, target_info: dict[str, Any]) -> None:
@@ -667,6 +756,9 @@ class CaptureRecorder:
         now_wall_time = time.time()
         for record in self._iter_pending_records():
             if record.get("stall_logged"):
+                continue
+            if record.get("resource_type") == "WebSocket":
+                # Sockets stay open by design; not a stalled request.
                 continue
 
             timing = record.get("timing", {})
@@ -883,6 +975,9 @@ class CaptureRecorder:
         response = record.setdefault("response", {})
         response["encoded_data_length"] = params.get("encodedDataLength")
 
+        if self._is_event_stream(response):
+            self._drain_stream_content(record)
+
         self._maybe_fetch_request_body(record)
         self._maybe_fetch_response_body(record)
         self.records.pop(key, None)
@@ -906,9 +1001,332 @@ class CaptureRecorder:
             "canceled": params.get("canceled"),
         }
 
+        if self._is_event_stream(record.setdefault("response", {})):
+            self._drain_stream_content(record)
+
         self._maybe_fetch_request_body(record)
         self.records.pop(key, None)
         self._write_record(record)
+
+    @staticmethod
+    def _is_event_stream(response: dict[str, Any]) -> bool:
+        mime_type = (response.get("mime_type") or "").lower()
+        if "event-stream" in mime_type:
+            return True
+        headers = response.get("headers") or {}
+        for name, value in headers.items():
+            if name.lower() == "content-type" and "event-stream" in (value or "").lower():
+                return True
+        return False
+
+    def _handle_data_received(
+        self,
+        session_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        record = self.records.get((session_id, request_id))
+        if record is None:
+            return
+        if not self._is_event_stream(record.get("response") or {}):
+            return
+        self._drain_stream_content(record)
+
+    def _handle_event_source_message(
+        self,
+        session_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        # Fired for EventSource connections (not fetch()-based streams).
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        record = self.records.get((session_id, request_id))
+        if record is None:
+            return
+        response = record.setdefault("response", {})
+        messages = response.setdefault("event_source_messages", [])
+        messages.append(
+            {
+                "timestamp": params.get("timestamp"),
+                "event": params.get("eventName") or "message",
+                "id": params.get("eventId"),
+                "data": params.get("data", ""),
+            }
+        )
+
+    def _get_or_create_ws_record(
+        self,
+        session_id: str | None,
+        request_id: str,
+    ) -> dict[str, Any]:
+        record = self.records.get((session_id, request_id))
+        if record is not None:
+            record.setdefault(
+                "websocket",
+                {
+                    "url": None,
+                    "handshake_request": None,
+                    "handshake_response": None,
+                    "frames": [],
+                    "frame_counts": {"sent": 0, "received": 0},
+                    "dropped_frames": 0,
+                    "closed": None,
+                    "error": None,
+                },
+            )
+            record["resource_type"] = "WebSocket"
+            return record
+
+        record = self._get_or_create_record(session_id, request_id)
+        record["resource_type"] = "WebSocket"
+        record["websocket"] = {
+            "url": None,
+            "handshake_request": None,
+            "handshake_response": None,
+            "frames": [],
+            "frame_counts": {"sent": 0, "received": 0},
+            "dropped_frames": 0,
+            "closed": None,
+            "error": None,
+        }
+        return record
+
+    def _handle_ws_created(
+        self,
+        session_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        record = self._get_or_create_ws_record(session_id, request_id)
+        websocket = record["websocket"]
+        websocket["url"] = params.get("url")
+        if params.get("initiator") is not None:
+            record["initiator"] = params["initiator"]
+        request = record.setdefault("request", {})
+        request.setdefault("url", params.get("url"))
+        request.setdefault("method", "GET")
+
+    def _handle_ws_handshake_request(
+        self,
+        session_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        record = self._get_or_create_ws_record(session_id, request_id)
+        websocket = record["websocket"]
+        payload = params.get("request") or {}
+        websocket["handshake_request"] = {
+            "timestamp": params.get("timestamp"),
+            "wall_time": params.get("wallTime"),
+            "headers": payload.get("headers"),
+            "headers_text": payload.get("headersText"),
+        }
+        request = record.setdefault("request", {})
+        request["method"] = "GET"
+        if websocket.get("url"):
+            request["url"] = websocket["url"]
+        request["headers"] = payload.get("headers", {})
+        timing = record.setdefault("timing", {})
+        timing.setdefault("timestamp", params.get("timestamp"))
+        timing.setdefault("wall_time", params.get("wallTime"))
+
+    def _handle_ws_handshake_response(
+        self,
+        session_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        record = self._get_or_create_ws_record(session_id, request_id)
+        websocket = record["websocket"]
+        payload = params.get("response") or {}
+        websocket["handshake_response"] = {
+            "timestamp": params.get("timestamp"),
+            "status": payload.get("status"),
+            "status_text": payload.get("statusText"),
+            "headers": payload.get("headers"),
+            "headers_text": payload.get("headersText"),
+        }
+        response = record.setdefault("response", {})
+        response["status"] = payload.get("status")
+        response["status_text"] = payload.get("statusText")
+        response["headers"] = payload.get("headers", {})
+
+    def _handle_ws_frame(
+        self,
+        session_id: str | None,
+        params: dict[str, Any],
+        *,
+        direction: str,
+    ) -> None:
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        record = self.records.get((session_id, request_id))
+        if record is None:
+            return
+        websocket = record.get("websocket")
+        if not websocket:
+            return
+        payload = params.get("response") or {}
+        opcode = payload.get("opcode")
+        frame = {
+            "direction": direction,
+            "timestamp": params.get("timestamp"),
+            "opcode": opcode,
+            "opcode_name": WS_OPCODE_NAMES.get(opcode, str(opcode)),
+            "payload_data": payload.get("payloadData", ""),
+        }
+        frames = websocket["frames"]
+        if len(frames) < DEFAULT_MAX_WS_FRAMES:
+            frames.append(frame)
+            websocket["frame_counts"][direction] += 1
+        else:
+            websocket["dropped_frames"] += 1
+
+    def _handle_ws_error(
+        self,
+        session_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        record = self.records.get((session_id, request_id))
+        if record is None or "websocket" not in record:
+            return
+        record["websocket"]["error"] = {
+            "timestamp": params.get("timestamp"),
+            "message": params.get("errorMessage"),
+        }
+
+    def _handle_ws_closed(
+        self,
+        session_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        request_id = params.get("requestId")
+        if not request_id:
+            return
+        key = (session_id, request_id)
+        record = self.records.pop(key, None)
+        if record is None:
+            return
+        websocket = record.setdefault("websocket", {})
+        websocket["closed"] = {"timestamp": params.get("timestamp")}
+        self._write_record(record)
+
+    def _drain_stream_content(self, record: dict[str, Any]) -> None:
+        """Pull buffered bytes of a streaming response into the record.
+
+        ``Network.getResponseBody`` does not return bodies of streaming
+        resources (``text/event-stream``, ``fetch()`` streams). DevTools'
+        EventStream panel uses ``Network.streamResourceContent`` instead; it
+        must be called while the stream is alive and returns base64-encoded
+        data buffered since the previous call.
+        """
+        if self._sse_stream_content_disabled:
+            return
+        request_id = record.get("request_id")
+        if not request_id:
+            return
+        session_id = record.get("session", {}).get("session_id")
+        response = record.setdefault("response", {})
+        response["sse_stream"] = True
+        try:
+            result = self.client.call(
+                "Network.streamResourceContent",
+                {"requestId": request_id},
+                session_id=session_id,
+                timeout=2.0,
+            )
+        except CDPError as exc:
+            message = str(exc).lower()
+            if "method" in message and ("not found" in message or "invalid" in message):
+                self._sse_stream_content_disabled = True
+            return
+        except (TimeoutError, EOFError, ConnectionError, OSError):
+            return
+
+        encoded = result.get("bufferedData")
+        if not encoded:
+            return
+        try:
+            chunk = base64.b64decode(encoded)
+        except (ValueError, TypeError):
+            return
+        key = (session_id, request_id)
+        buffer = self._sse_buffers.get(key)
+        if buffer is None:
+            self._sse_buffers[key] = bytearray(chunk)
+            return
+        existing = bytes(buffer)
+        if chunk.startswith(existing):
+            # streamResourceContent returns the content buffered so far;
+            # keep only the new suffix.
+            buffer.extend(chunk[len(existing):])
+        elif existing.startswith(chunk):
+            # Older/stale snapshot; nothing new.
+            return
+        else:
+            buffer.extend(chunk)
+
+    def _finalize_sse_body(self, record: dict[str, Any]) -> None:
+        """Attach streamed SSE bytes as the record's response body."""
+        response = record.get("response") or {}
+        if not response:
+            return
+        key = (record.get("session", {}).get("session_id"), record.get("request_id"))
+        buffer = self._sse_buffers.pop(key, None)
+        if buffer is None and not self._is_event_stream(response):
+            return
+
+        buffered_text = bytes(buffer).decode("utf-8", "replace") if buffer else ""
+        body = response.get("body") or {}
+        if body.get("base64Encoded"):
+            try:
+                existing_text = base64.b64decode(body.get("base64", "")).decode(
+                    "utf-8", "replace"
+                )
+            except (ValueError, TypeError):
+                existing_text = ""
+        else:
+            existing_text = body.get("text") or ""
+
+        # Prefer the most complete representation we have: getResponseBody()
+        # may return the full body when the stream already finished, while
+        # streamResourceContent() gives us the live chunks.
+        if len(buffered_text) > len(existing_text):
+            response["body"] = {
+                "text": buffered_text,
+                "base64Encoded": False,
+            }
+            response.pop("body_error", None)
+            existing_text = buffered_text
+
+        if existing_text:
+            events = parse_sse_events(existing_text)
+            if events:
+                response["sse_events"] = events
+                response["sse"] = True
+        if response.get("event_source_messages") and "sse_events" not in response:
+            response["sse_events"] = [
+                {
+                    "event": message.get("event") or "message",
+                    "id": message.get("id"),
+                    "data": message.get("data", ""),
+                }
+                for message in response["event_source_messages"]
+            ]
+            response["sse"] = True
 
     def _merge_response_payload(self, response: dict[str, Any], payload: dict[str, Any]) -> None:
         response["url"] = payload.get("url", response.get("url"))
@@ -986,6 +1404,7 @@ class CaptureRecorder:
             }
 
     def _write_record(self, record: dict[str, Any]) -> None:
+        self._finalize_sse_body(record)
         session_id = record.get("session", {}).get("session_id")
         session_info = self.sessions.get(session_id or "")
         if session_info:

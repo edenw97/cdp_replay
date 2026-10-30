@@ -82,6 +82,46 @@ Notes:
 - Press Ctrl+C to stop; pending requests are flushed and reported.
 - Records where the body could not be retrieved contain a `body_error` field instead.
 
+### SSE / event streams
+
+`Network.getResponseBody` does not return bodies of streaming resources
+(`text/event-stream`, `fetch()`-based streams). The capture command pulls those
+with `Network.streamResourceContent` while the stream is live (Chrome 115+) and
+stores them like any other body:
+
+- `response.body.text` / `response.body.base64Encoded` — the full decoded SSE
+  stream (also for `content-encoding: gzip`/`br`; CDP returns decoded data)
+- `response.sse_events` — the parsed events, each
+  `{"event": "delta", "id": null, "data": "…"}` (multi-line `data:` joined with
+  `\n`, `:` comments ignored)
+- `response.sse` — `true` for such records
+- `response.event_source_messages` — raw `Network.eventSourceMessageReceived`
+  events, when the page used `EventSource` instead of `fetch()`
+
+Replay works unchanged: the recorded SSE body is served as the response body.
+
+### WebSocket
+
+Each WebSocket connection is written as **one JSONL record per connection**
+(`resource_type: "WebSocket"`), on close or when the capture stops:
+
+- `request` / `response`: the handshake (`GET wss://…`, status `101`, headers)
+- `websocket.url`
+- `websocket.handshake_request` / `websocket.handshake_response`
+  (timestamp, headers, `headersText`)
+- `websocket.frames`: ordered frames,
+  `{"direction": "sent"|"received", "timestamp": ..., "opcode": 1,
+    "opcode_name": "text", "payload_data": "..."}`
+  Text frames carry plain text; binary frames keep CDP's base64 payload
+  (`opcode: 2`)
+- `websocket.frame_counts` (`sent`/`received`), `websocket.dropped_frames`
+  (max 20,000 frames per connection)
+- `websocket.closed` / `websocket.error`; connections still open when the
+  capture stops are written with `incomplete: true`
+
+WebSocket records are capture-only: `server` and `client` skip them
+(non-HTTP `wss://` URLs), so replay behaviour is unchanged.
+
 ## server
 
 ```console
